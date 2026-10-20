@@ -2626,8 +2626,8 @@ fn export_size_estimate_tracks_the_files_written() {
     // Identical pages: scaling the measured bytes per pixel must reach each one's file size.
     let mut blank = Session::new();
     let bytes = blank.create_blank(612.0, 792.0, 5).unwrap();
-    let id = blank.open_new("blank.pdf", bytes).unwrap();
-    let mut ex = Exporter::new(blank.get(id).unwrap());
+    let blank_id = blank.open_new("blank.pdf", bytes).unwrap();
+    let mut ex = Exporter::new(blank.get(blank_id).unwrap());
     let pages = [0, 1, 2, 3, 4];
     for format in [ImageFormat::Png, ImageFormat::Jpeg { quality: 85 }, ImageFormat::Tiff] {
         let estimate = ex.estimate(&pages, 150.0, format).unwrap();
@@ -2647,11 +2647,18 @@ fn export_size_estimate_tracks_the_files_written() {
         let ratio = *estimated as f64 / *actual as f64;
         assert!((0.75..=1.25).contains(&ratio), "page {}: estimated {estimated} bytes, wrote {actual}", page + 1);
     }
-    // A page too large to draw whole is measured smaller, and still lands close to the file.
-    let estimate = ex.estimate(&[0], 600.0, ImageFormat::Jpeg { quality: 85 }).unwrap();
-    let written = ex.image(0, 600.0, ImageFormat::Jpeg { quality: 85 }).unwrap().len() as u64;
+    // A page too large to draw whole — 612 × 792 pt at 600 dpi is 33.7 MP, over the 16 MP sample
+    // budget — is measured smaller. Bytes per pixel fall with resolution, so it reads a little
+    // high, and still lands close to the file.
+    let mut big = Exporter::new(blank.get(blank_id).unwrap());
+    let estimate = big.estimate(&[0], 600.0, ImageFormat::Jpeg { quality: 85 }).unwrap();
+    let written = big.image(0, 600.0, ImageFormat::Jpeg { quality: 85 }).unwrap().len() as u64;
+    assert!(estimate.pages[0] >= written, "a smaller sample errs high: estimated {} bytes, wrote {written}", estimate.pages[0]);
     let ratio = estimate.pages[0] as f64 / written as f64;
     assert!((0.5..=2.0).contains(&ratio), "600 dpi: estimated {} bytes, wrote {written}", estimate.pages[0]);
+    // An estimate that is no longer wanted stops before it draws a page.
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    assert!(big.estimate_cancellable(&[0], 600.0, ImageFormat::Png, &cancel).is_err(), "a cancelled estimate reports nothing");
     // A page the source does not have is refused, as exporting it would be; an empty range has
     // nothing to estimate.
     assert!(ex.estimate(&[9], 150.0, ImageFormat::Png).is_err());

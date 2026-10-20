@@ -49,21 +49,32 @@ pub type ExportStatus = Arc<Mutex<Option<(usize, usize, Option<String>)>>>;
 /// starts a new one.
 #[derive(Clone, PartialEq, Eq)]
 struct SizeKey {
+    /// The document whose pages are measured.
     doc: DocId,
+    /// The document's edit generation, so an undo or an edit measures again.
     generation: u64,
+    /// The 0-based pages the export would write.
     pages: Vec<usize>,
     /// The resolution's bits, so the key compares exactly without a float.
     dpi: u64,
+    /// The file format (and JPEG quality) the pages would be written in.
     format: ImageFormat,
 }
 
+/// One running size estimate: the settings it was started for, its worker's result, and the flag
+/// that stops it.
 struct SizeJob {
+    /// The settings this estimate was started for; a result is only kept while it still matches.
     key: SizeKey,
+    /// The worker's result, once it has one.
     receiver: mpsc::Receiver<Result<SizeEstimate, String>>,
+    /// Set when this estimate is no longer wanted (a new key, or the dialog closed); the worker
+    /// reads it before starting and between the pages it draws.
     cancel: Arc<AtomicBool>,
 }
 
 impl Drop for SizeJob {
+    /// Dropping the job is cancellation: nothing will read what it measures.
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -93,6 +104,8 @@ impl SizeDraft {
         self.result = None;
     }
 
+    /// Keep `key`'s estimate up to date: start a worker once the settings have settled, drop the
+    /// result of a job whose key has changed, and take the finished estimate when it arrives.
     fn update(&mut self, key: SizeKey, source: impl FnOnce() -> ExportSource, ctx: &egui::Context, inline: bool) {
         if self.key.as_ref() != Some(&key) {
             if let Some(job) = &self.job {
@@ -129,7 +142,12 @@ impl SizeDraft {
         self.job = Some(SizeJob { key, receiver, cancel: cancel.clone() });
         let ctx = ctx.clone();
         let work = move || {
-            let result = Exporter::from_source(source).estimate(&pages, dpi, format);
+            // The dialog may have closed, or the settings changed, while this worker waited to
+            // start: there is nothing to measure for any more.
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let result = Exporter::from_source(source).estimate_cancellable(&pages, dpi, format, &cancel);
             let _ = sender.send(result);
             ctx.request_repaint();
         };
@@ -184,6 +202,8 @@ fn size_line(ui: &mut egui::Ui, size: &SizeDraft, t: &Tokens) {
     }
 }
 
+/// The Export dialog's body: the format and resolution (and page range) controls, the estimate of
+/// what the files will take, and the Export button. Returns (export clicked, cancel clicked).
 pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: ExportKind) -> (bool, bool) {
     let active = app.active_ids();
     let count = active.and_then(|(_, id)| app.session.get(id)).map(|d| d.info.pages.len()).unwrap_or(0);

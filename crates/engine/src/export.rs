@@ -4,6 +4,8 @@
 //! text, from a
 //! document's working file (so unsaved edits and hidden layers are respected, as on screen).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use pdfcraft_render::{PageRenderer, RenderRequest, RequestKind};
 
 use crate::Document;
@@ -74,6 +76,10 @@ impl SizeEstimate {
         self.pages.iter().copied().fold(0, u64::saturating_add)
     }
 }
+
+/// What [`Exporter::estimate_cancellable`] returns when it is stopped. The estimate it was making
+/// would have been thrown away, so it says why instead of reporting one.
+const ESTIMATE_CANCELLED: &str = "the size estimate was cancelled";
 
 /// The pages [`Exporter::estimate`] measures: the first, the middle and the last of `pages`, each
 /// once, so a short range is measured whole and a long one samples its ends and its middle.
@@ -153,7 +159,20 @@ impl Exporter {
     /// (bytes per pixel fall as resolution rises), so the estimate errs on the large side. The
     /// files can still differ from the estimate, most of all when the pages it did not measure
     /// differ from the ones it did.
+    ///
+    /// This runs to the end; [`Exporter::estimate_cancellable`] stops early when it is no longer
+    /// wanted.
     pub fn estimate(&mut self, pages: &[usize], dpi: f64, format: ImageFormat) -> Result<SizeEstimate, String> {
+        self.estimate_cancellable(pages, dpi, format, &AtomicBool::new(false))
+    }
+
+    /// [`Exporter::estimate`], given up on when `cancel` is set: it is checked before any page is
+    /// drawn and again between samples, so a closed dialog stops drawing pages no one will read.
+    /// A single render cannot be interrupted, so a stop waits for the page in hand to finish.
+    pub fn estimate_cancellable(&mut self, pages: &[usize], dpi: f64, format: ImageFormat, cancel: &AtomicBool) -> Result<SizeEstimate, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ESTIMATE_CANCELLED.to_string());
+        }
         for page in pages {
             self.check(*page)?;
         }
@@ -164,6 +183,9 @@ impl Exporter {
         let mut bits = 0.0f64;
         let mut drawn = 0.0f64;
         for page in &sampled {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ESTIMATE_CANCELLED.to_string());
+            }
             let (bytes, pixels) = self.draw_sample(*page, dpi, format)?;
             if pixels > 0.0 {
                 bits += bytes as f64 * 8.0;
@@ -195,7 +217,10 @@ impl Exporter {
         if let Some(e) = r.error {
             return Err(format!("page {}: {e}", page + 1));
         }
-        let bytes = encode_image(r.width, r.height, &r.rgba, format)?;
+        // The sample is thrown away once measured, so it records the export's own resolution:
+        // the metadata adds the same few bytes either way, and the encode path stays the one the
+        // file will take.
+        let bytes = encode_image(r.width, r.height, &r.rgba, format, self.dpi_used(page, dpi))?;
         Ok((bytes.len() as u64, f64::from(r.width) * f64::from(r.height)))
     }
 
