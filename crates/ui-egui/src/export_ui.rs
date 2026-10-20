@@ -73,6 +73,14 @@ struct SizeJob {
     cancel: Arc<AtomicBool>,
 }
 
+impl SizeJob {
+    /// Whether its worker has exited: a worker drops its sender when it returns, which the
+    /// receiver reports as disconnected (a worker that finished normally sends first).
+    fn finished(&self) -> bool {
+        matches!(self.receiver.try_recv(), Ok(_) | Err(mpsc::TryRecvError::Disconnected))
+    }
+}
+
 impl Drop for SizeJob {
     /// Dropping the job is cancellation: nothing will read what it measures.
     fn drop(&mut self) {
@@ -80,8 +88,8 @@ impl Drop for SizeJob {
     }
 }
 
-/// The export dialog's size estimate: at most one worker, and no stale result after the settings,
-/// the document or the page range change.
+/// The export dialog's size estimate: at most one worker running, and no stale result after the
+/// settings, the document or the page range change.
 #[derive(Default)]
 pub(crate) struct SizeDraft {
     key: Option<SizeKey>,
@@ -89,27 +97,38 @@ pub(crate) struct SizeDraft {
     /// quality slider does not start a worker per frame.
     settled: Option<SizeKey>,
     job: Option<SizeJob>,
+    /// Cancelled estimates whose worker has not exited yet. A render cannot be interrupted, so a
+    /// new worker waits for these: closing and reopening the dialog then cannot stack renders.
+    retiring: Vec<SizeJob>,
     result: Option<Result<SizeEstimate, String>>,
 }
 
 impl SizeDraft {
     /// Stop measuring and forget the last estimate (the dialog closed, or another document is up).
     pub(crate) fn cancel(&mut self) {
-        if let Some(job) = &self.job {
+        if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
+            self.retiring.push(job);
         }
         self.key = None;
         self.settled = None;
-        self.job = None;
         self.result = None;
+        self.prune();
+    }
+
+    /// Forget the cancelled workers that have exited.
+    fn prune(&mut self) {
+        self.retiring.retain(|job| !job.finished());
     }
 
     /// Keep `key`'s estimate up to date: start a worker once the settings have settled, drop the
     /// result of a job whose key has changed, and take the finished estimate when it arrives.
     fn update(&mut self, key: SizeKey, source: impl FnOnce() -> ExportSource, ctx: &egui::Context, inline: bool) {
+        self.prune();
         if self.key.as_ref() != Some(&key) {
-            if let Some(job) = &self.job {
+            if let Some(job) = self.job.take() {
                 job.cancel.store(true, Ordering::Relaxed);
+                self.retiring.push(job);
             }
             self.key = Some(key.clone());
             self.settled = None;
@@ -131,8 +150,17 @@ impl SizeDraft {
         if self.job.is_some() || self.result.is_some() {
             return;
         }
+        if !self.retiring.is_empty() {
+            // A cancelled estimate is still winding down. Start nothing until it exits, and keep
+            // the frame coming so this notices when it does.
+            ctx.request_repaint();
+            return;
+        }
         if self.settled.as_ref() != Some(&key) {
             self.settled = Some(key);
+            // The settling frame starts no worker, so ask for the next frame itself: the estimate
+            // must not wait for the user to move the mouse.
+            ctx.request_repaint();
             return;
         }
         let source = source();
@@ -483,5 +511,70 @@ impl PdfCraftApp {
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The settings for edit `generation`, asking to measure page 0.
+    fn key(generation: u64) -> SizeKey {
+        SizeKey { doc: DocId(1), generation, pages: vec![0], dpi: 150.0f64.to_bits(), format: ImageFormat::Png }
+    }
+
+    /// A source with no pages: measuring it fails at once, which is enough to see a worker start.
+    fn source() -> ExportSource {
+        ExportSource { bytes: Arc::new(Vec::new()), config: Default::default(), pages: 0, sizes: Vec::new() }
+    }
+
+    /// A render cannot be interrupted, so a cancelled estimate keeps its slot until its worker
+    /// exits. Closing and reopening the dialog then cannot stack renders.
+    #[test]
+    fn a_cancelled_worker_keeps_its_slot_until_it_exits() {
+        let ctx = egui::Context::default();
+        let mut draft = SizeDraft::default();
+        // A worker that is still rendering: its sender is alive, so it has not exited.
+        let (sender, receiver) = mpsc::channel();
+        draft.key = Some(key(1));
+        draft.job = Some(SizeJob { key: key(1), receiver, cancel: Arc::new(AtomicBool::new(false)) });
+
+        // New settings cancel it, but nothing starts while it winds down.
+        let mut started = 0;
+        draft.update(
+            key(2),
+            || {
+                started += 1;
+                source()
+            },
+            &ctx,
+            true,
+        );
+        assert_eq!(started, 0, "no worker while a cancelled one is still rendering");
+        assert_eq!(draft.retiring.len(), 1, "the cancelled worker is still accounted for");
+
+        // The worker exits (drops its sender). The new estimate settles, then starts.
+        drop(sender);
+        draft.update(
+            key(2),
+            || {
+                started += 1;
+                source()
+            },
+            &ctx,
+            true,
+        );
+        assert_eq!(started, 0, "the frame after settling only settles");
+        draft.update(
+            key(2),
+            || {
+                started += 1;
+                source()
+            },
+            &ctx,
+            true,
+        );
+        assert_eq!(started, 1, "the estimate starts once the previous worker has exited");
+        assert!(draft.retiring.is_empty(), "the exited worker is forgotten");
     }
 }
